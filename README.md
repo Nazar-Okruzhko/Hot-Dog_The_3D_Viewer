@@ -1,3 +1,1 @@
-# Hot-Dog - The 3D Viewer
-
-//####//[BETA]//####//
+# Hot-Dog - The 3D Viewer [BETA]
