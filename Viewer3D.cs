@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using OpenTK;
 using OpenTK.Graphics.OpenGL;
@@ -9,6 +10,228 @@ using OpenTK.Graphics;
 
 namespace Viewer3D
 {
+    public class Shader
+    {
+        public int ProgramId;
+        private Dictionary<string, int> uniformCache = new Dictionary<string, int>();
+        
+        public Shader(string vertexSrc, string fragmentSrc)
+        {
+            int vertId = CompileShader(ShaderType.VertexShader, vertexSrc);
+            int fragId = CompileShader(ShaderType.FragmentShader, fragmentSrc);
+            ProgramId = GL.CreateProgram();
+            GL.AttachShader(ProgramId, vertId);
+            GL.AttachShader(ProgramId, fragId);
+            GL.LinkProgram(ProgramId);
+            
+            GL.GetProgram(ProgramId, GetProgramParameterName.LinkStatus, out int status);
+            if (status == 0)
+                throw new Exception("Shader link failed: " + GL.GetProgramInfoLog(ProgramId));
+            
+            GL.DeleteShader(vertId);
+            GL.DeleteShader(fragId);
+        }
+        
+        private int CompileShader(ShaderType type, string src)
+        {
+            int id = GL.CreateShader(type);
+            GL.ShaderSource(id, src);
+            GL.CompileShader(id);
+            GL.GetShader(id, ShaderParameter.CompileStatus, out int status);
+            if (status == 0)
+                throw new Exception($"{type} compile failed: {GL.GetShaderInfoLog(id)}");
+            return id;
+        }
+        
+        public void Use() => GL.UseProgram(ProgramId);
+        
+        public int GetUniformLocation(string name)
+        {
+            if (!uniformCache.TryGetValue(name, out int loc))
+            {
+                loc = GL.GetUniformLocation(ProgramId, name);
+                uniformCache[name] = loc;
+            }
+            return loc;
+        }
+        
+        public void SetInt(string name, int val) => GL.Uniform1(GetUniformLocation(name), val);
+        public void SetFloat(string name, float val) => GL.Uniform1(GetUniformLocation(name), val);
+        public void SetVec2(string name, Vector2 val) => GL.Uniform2(GetUniformLocation(name), val);
+        public void SetVec3(string name, Vector3 val) => GL.Uniform3(GetUniformLocation(name), val);
+        public void SetMat4(string name, ref Matrix4 val) => GL.UniformMatrix4(GetUniformLocation(name), false, ref val);
+    }
+    
+    public static class ShaderSource
+    {
+        public const string VertexShader = @"
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec2 aTexCoord;
+layout(location = 3) in vec3 aTangent;
+
+out vec3 FragPos;
+out vec3 Normal;
+out vec2 TexCoord;
+out mat3 TBN;
+out vec2 ScreenPos;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+void main()
+{
+    FragPos = vec3(model * vec4(aPos, 1.0));
+    Normal = mat3(transpose(inverse(model))) * aNormal;
+    TexCoord = aTexCoord;
+    
+    vec3 T = normalize(mat3(model) * aTangent);
+    vec3 N = normalize(Normal);
+    T = normalize(T - dot(T, N) * N);
+    vec3 B = cross(N, T);
+    TBN = mat3(T, B, N);
+    
+    gl_Position = projection * view * vec4(FragPos, 1.0);
+    ScreenPos = gl_Position.xy / gl_Position.w;
+}
+";
+
+        public const string FragmentShader = @"
+#version 330 core
+out vec4 FragColor;
+
+in vec3 FragPos;
+in vec3 Normal;
+in vec2 TexCoord;
+in mat3 TBN;
+in vec2 ScreenPos;
+
+uniform vec3 lightPos;
+uniform vec3 lightPos2;
+uniform vec3 viewPos;
+
+uniform sampler2D colorMap;
+uniform sampler2D normalMap;
+uniform sampler2D specularMap;
+uniform sampler2D roughnessMap;
+uniform sampler2D metallicMap;
+uniform sampler2D opacityMap;
+
+uniform bool hasColorMap;
+uniform bool hasNormalMap;
+uniform bool hasSpecularMap;
+uniform bool hasRoughnessMap;
+uniform bool hasMetallicMap;
+uniform bool hasOpacityMap;
+
+uniform int shadingMode;
+uniform vec3 solidColor;
+
+vec3 calcLight(vec3 lightPos, vec3 lightColor, vec3 norm, vec3 viewDir, vec3 albedo, float roughness, float metallic, float specularStrength)
+{
+    vec3 lightDir = normalize(lightPos - FragPos);
+    float diff = max(dot(norm, lightDir), 0.0);
+    
+    vec3 halfDir = normalize(lightDir + viewDir);
+    float spec = pow(max(dot(norm, halfDir), 0.0), (1.0 - roughness) * 64.0 + 1.0);
+    
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(halfDir, viewDir), 0.0), 5.0);
+    
+    vec3 kD = (1.0 - F) * (1.0 - metallic);
+    
+    vec3 ambient = 0.45 * lightColor * albedo;
+    vec3 diffuse = kD * diff * lightColor * albedo * 1.5;
+    vec3 specular = F * spec * specularStrength * lightColor * 1.5;
+    
+    float distance = length(lightPos - FragPos);
+    float attenuation = 1.0 / (1.0 + 0.01 * distance + 0.001 * distance * distance);
+    
+    return (ambient + (diffuse + specular) * attenuation);
+}
+
+void main()
+{
+    if (shadingMode == 1) {
+        FragColor = vec4(0.96, 0.96, 0.96, 1.0);
+        return;
+    }
+    
+    vec3 albedo = solidColor;
+    if (hasColorMap)
+        albedo = texture(colorMap, TexCoord).rgb;
+    
+    vec3 norm = normalize(Normal);
+    if (hasNormalMap) {
+        vec3 normalTex = texture(normalMap, TexCoord).rgb * 2.0 - 1.0;
+        norm = normalize(TBN * normalTex);
+    }
+    
+    float roughness = 0.5;
+    if (hasRoughnessMap)
+        roughness = texture(roughnessMap, TexCoord).r;
+    
+    float metallic = 0.0;
+    if (hasMetallicMap)
+        metallic = texture(metallicMap, TexCoord).r;
+    
+    float specularStrength = 0.5;
+    if (hasSpecularMap)
+        specularStrength = texture(specularMap, TexCoord).r;
+    
+    vec3 viewDir = normalize(viewPos - FragPos);
+    
+    vec3 result = calcLight(lightPos, vec3(1.35, 1.35, 1.35), norm, viewDir, albedo, roughness, metallic, specularStrength);
+    result += calcLight(lightPos2, vec3(0.75, 0.75, 0.75), norm, viewDir, albedo, roughness, metallic, specularStrength);
+    
+    float opacity = 1.0;
+    if (hasOpacityMap)
+        opacity = texture(opacityMap, TexCoord).r;
+    
+    float dist = length(ScreenPos);
+    float vignette = smoothstep(1.4, 0.5, dist);
+    vignette = mix(0.85, 1.0, vignette);
+    result *= vignette;
+    
+    FragColor = vec4(result, opacity);
+}
+";
+
+        public const string WireframeVertexShader = @"
+#version 330 core
+layout(location = 0) in vec3 aPos;
+
+out vec2 ScreenPos;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+void main()
+{
+    gl_Position = projection * view * model * vec4(aPos, 1.0);
+    ScreenPos = gl_Position.xy / gl_Position.w;
+}
+";
+
+        public const string WireframeFragmentShader = @"
+#version 330 core
+out vec4 FragColor;
+in vec2 ScreenPos;
+uniform vec3 color;
+
+void main()
+{
+    float dist = length(ScreenPos);
+    float vignette = smoothstep(1.4, 0.5, dist);
+    vignette = mix(0.85, 1.0, vignette);
+    FragColor = vec4(color * vignette, 1.0);
+}
+";
+    }
+    
     public class OBJLoader
     {
         public List<Vector3> Vertices = new List<Vector3>();
@@ -29,6 +252,9 @@ namespace Viewer3D
         public Vector3 BoundsMin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
         public Vector3 BoundsMax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
         public int EdgeCount { get; private set; }
+        
+        public int VAO, VBO, EBO;
+        private int indexCount;
         
         public class Face
         {
@@ -127,6 +353,126 @@ namespace Viewer3D
             EdgeCount = edgeSet.Count;
             
             LoadMaterial(filename);
+            BuildBuffers();
+        }
+        
+        private void BuildBuffers()
+        {
+            var vertexData = new List<float>();
+            var indices = new List<uint>();
+            
+            for (int i = 0; i < Faces.Count; i++)
+            {
+                var face = Faces[i];
+                for (int j = 0; j < 3; j++)
+                {
+                    var pos = Vertices[face.VertexIndices[j]];
+                    vertexData.Add(pos.X);
+                    vertexData.Add(pos.Y);
+                    vertexData.Add(pos.Z);
+                    
+                    if (face.NormalIndices[j] < Normals.Count)
+                    {
+                        var norm = Normals[face.NormalIndices[j]];
+                        vertexData.Add(norm.X);
+                        vertexData.Add(norm.Y);
+                        vertexData.Add(norm.Z);
+                    }
+                    else
+                    {
+                        vertexData.Add(0f);
+                        vertexData.Add(1f);
+                        vertexData.Add(0f);
+                    }
+                    
+                    if (face.TexCoordIndices[j] < TexCoords.Count)
+                    {
+                        var uv = TexCoords[face.TexCoordIndices[j]];
+                        vertexData.Add(uv.X);
+                        vertexData.Add(uv.Y);
+                    }
+                    else
+                    {
+                        vertexData.Add(0f);
+                        vertexData.Add(0f);
+                    }
+                    
+                    vertexData.Add(1f);
+                    vertexData.Add(0f);
+                    vertexData.Add(0f);
+                    
+                    indices.Add((uint)(i * 3 + j));
+                }
+            }
+            
+            ComputeTangents(vertexData, indices);
+            
+            VAO = GL.GenVertexArray();
+            VBO = GL.GenBuffer();
+            EBO = GL.GenBuffer();
+            
+            GL.BindVertexArray(VAO);
+            
+            GL.BindBuffer(BufferTarget.ArrayBuffer, VBO);
+            GL.BufferData(BufferTarget.ArrayBuffer, vertexData.Count * sizeof(float), vertexData.ToArray(), BufferUsageHint.StaticDraw);
+            
+            GL.BindBuffer(BufferTarget.ElementArrayBuffer, EBO);
+            GL.BufferData(BufferTarget.ElementArrayBuffer, indices.Count * sizeof(uint), indices.ToArray(), BufferUsageHint.StaticDraw);
+            
+            int stride = 11 * sizeof(float);
+            GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, stride, 0);
+            GL.EnableVertexAttribArray(0);
+            GL.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, 3 * sizeof(float));
+            GL.EnableVertexAttribArray(1);
+            GL.VertexAttribPointer(2, 2, VertexAttribPointerType.Float, false, stride, 6 * sizeof(float));
+            GL.EnableVertexAttribArray(2);
+            GL.VertexAttribPointer(3, 3, VertexAttribPointerType.Float, false, stride, 8 * sizeof(float));
+            GL.EnableVertexAttribArray(3);
+            
+            GL.BindVertexArray(0);
+            
+            indexCount = indices.Count;
+        }
+        
+        private void ComputeTangents(List<float> vertexData, List<uint> indices)
+        {
+            for (int i = 0; i < indices.Count; i += 3)
+            {
+                int i0 = (int)indices[i] * 11;
+                int i1 = (int)indices[i + 1] * 11;
+                int i2 = (int)indices[i + 2] * 11;
+                
+                Vector3 v0 = new Vector3(vertexData[i0], vertexData[i0 + 1], vertexData[i0 + 2]);
+                Vector3 v1 = new Vector3(vertexData[i1], vertexData[i1 + 1], vertexData[i1 + 2]);
+                Vector3 v2 = new Vector3(vertexData[i2], vertexData[i2 + 1], vertexData[i2 + 2]);
+                
+                Vector2 uv0 = new Vector2(vertexData[i0 + 6], vertexData[i0 + 7]);
+                Vector2 uv1 = new Vector2(vertexData[i1 + 6], vertexData[i1 + 7]);
+                Vector2 uv2 = new Vector2(vertexData[i2 + 6], vertexData[i2 + 7]);
+                
+                Vector3 edge1 = v1 - v0;
+                Vector3 edge2 = v2 - v0;
+                Vector2 deltaUV1 = uv1 - uv0;
+                Vector2 deltaUV2 = uv2 - uv0;
+                
+                float f = 1.0f / (deltaUV1.X * deltaUV2.Y - deltaUV2.X * deltaUV1.Y + 0.0001f);
+                Vector3 tangent = new Vector3(
+                    f * (deltaUV2.Y * edge1.X - deltaUV1.Y * edge2.X),
+                    f * (deltaUV2.Y * edge1.Y - deltaUV1.Y * edge2.Y),
+                    f * (deltaUV2.Y * edge1.Z - deltaUV1.Y * edge2.Z)
+                );
+                tangent.Normalize();
+                
+                vertexData[i0 + 8] = tangent.X;
+                vertexData[i0 + 9] = tangent.Y;
+                vertexData[i0 + 10] = tangent.Z;
+                vertexData[i1 + 8] = tangent.X;
+                vertexData[i1 + 9] = tangent.Y;
+                vertexData[i1 + 10] = tangent.Z;
+                vertexData[i2 + 8] = tangent.X;
+                vertexData[i2 + 9] = tangent.Y;
+                vertexData[i2 + 10] = tangent.Z;
+            }
         }
         
         private void LoadMaterial(string objFilename)
@@ -170,7 +516,7 @@ namespace Viewer3D
             
             var baseDir = Path.GetDirectoryName(objFilename);
             var baseName = Path.GetFileNameWithoutExtension(objFilename);
-            var extensions = new[] { ".png", ".jpg", ".jpeg", ".bmp" };
+            var extensions = new[] { ".png", ".jpg", ".jpeg", ".bmp", ".dds", ".tga" };
             
             foreach (var ext in extensions)
             {
@@ -189,7 +535,25 @@ namespace Viewer3D
         {
             try
             {
-                var bitmap = new Bitmap(filename);
+                Bitmap bitmap = null;
+                string ext = Path.GetExtension(filename).ToLower();
+                
+                if (ext == ".dds")
+                {
+                    bitmap = LoadDDS(filename);
+                }
+                else if (ext == ".tga")
+                {
+                    bitmap = LoadTGA(filename);
+                }
+                else
+                {
+                    bitmap = new Bitmap(filename);
+                }
+                
+                if (bitmap == null)
+                    return -1;
+                
                 bitmap.RotateFlip(RotateFlipType.RotateNoneFlipY);
                 var data = bitmap.LockBits(new Rectangle(0, 0, bitmap.Width, bitmap.Height),
                     System.Drawing.Imaging.ImageLockMode.ReadOnly,
@@ -197,10 +561,13 @@ namespace Viewer3D
                 
                 int texId = GL.GenTexture();
                 GL.BindTexture(TextureTarget.Texture2D, texId);
-                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.LinearMipmapLinear);
                 GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.Repeat);
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.Repeat);
                 GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgb, bitmap.Width, bitmap.Height, 0,
                     PixelFormat.Bgr, PixelType.UnsignedByte, data.Scan0);
+                GL.GenerateMipmap(GenerateMipmapTarget.Texture2D);
                 
                 bitmap.UnlockBits(data);
                 bitmap.Dispose();
@@ -213,14 +580,100 @@ namespace Viewer3D
             }
         }
         
-        public void LoadTexture(string filename)
+        private Bitmap LoadDDS(string filename)
+        {
+            try
+            {
+                using (var fs = new FileStream(filename, FileMode.Open, FileAccess.Read))
+                using (var br = new BinaryReader(fs))
+                {
+                    uint magic = br.ReadUInt32();
+                    if (magic != 0x20534444) return null;
+                    
+                    br.ReadBytes(4);
+                    int height = br.ReadInt32();
+                    int width = br.ReadInt32();
+                    br.ReadBytes(108 - 16);
+                    
+                    byte[] pixelData = br.ReadBytes(width * height * 4);
+                    
+                    Bitmap bmp = new Bitmap(width, height);
+                    int idx = 0;
+                    for (int y = 0; y < height; y++)
+                    {
+                        for (int x = 0; x < width; x++)
+                        {
+                            byte b = pixelData[idx++];
+                            byte g = pixelData[idx++];
+                            byte r = pixelData[idx++];
+                            byte a = pixelData[idx++];
+                            bmp.SetPixel(x, y, Color.FromArgb(a, r, g, b));
+                        }
+                    }
+                    return bmp;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+        
+        private Bitmap LoadTGA(string filename)
+        {
+            try
+            {
+                using (var fs = new FileStream(filename, FileMode.Open, FileAccess.Read))
+                using (var br = new BinaryReader(fs))
+                {
+                    br.ReadBytes(2);
+                    byte imageType = br.ReadByte();
+                    br.ReadBytes(9);
+                    short width = br.ReadInt16();
+                    short height = br.ReadInt16();
+                    byte bpp = br.ReadByte();
+                    br.ReadByte();
+                    
+                    int bytesPerPixel = bpp / 8;
+                    byte[] pixelData = br.ReadBytes(width * height * bytesPerPixel);
+                    
+                    Bitmap bmp = new Bitmap(width, height);
+                    int idx = 0;
+                    for (int y = 0; y < height; y++)
+                    {
+                        for (int x = 0; x < width; x++)
+                        {
+                            byte b = pixelData[idx++];
+                            byte g = pixelData[idx++];
+                            byte r = pixelData[idx++];
+                            byte a = bytesPerPixel == 4 ? pixelData[idx++] : (byte)255;
+                            bmp.SetPixel(x, y, Color.FromArgb(a, r, g, b));
+                        }
+                    }
+                    return bmp;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+        
+        public void LoadTexture(string filename, int mapType)
         {
             int texId = LoadTextureFile(filename);
             if (texId >= 0)
             {
-                ColorMapId = texId;
-                TextureId = texId;
-                HasTexture = true;
+                switch (mapType)
+                {
+                    case 0: ColorMapId = texId; break;
+                    case 1: NormalMapId = texId; break;
+                    case 2: SpecularMapId = texId; break;
+                    case 3: RoughnessMapId = texId; break;
+                    case 4: MetallicMapId = texId; break;
+                    case 5: OpacityMapId = texId; break;
+                }
+                SetActiveTexture(mapType);
             }
         }
         
@@ -248,86 +701,66 @@ namespace Viewer3D
             return (BoundsMin + BoundsMax) / 2;
         }
         
-        public void Render(bool wireframe, bool solidWhite)
+        public void Render(Shader shader, int shadingMode)
         {
-            if (wireframe)
+            shader.Use();
+            shader.SetInt("shadingMode", shadingMode);
+            
+            if (shadingMode == 2)
             {
-                GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
-                GL.Disable(EnableCap.Lighting);
-                GL.Color3(0.96f, 0.96f, 0.96f);
+                shader.SetVec3("solidColor", new Vector3(1f, 1f, 1f));
                 
-                GL.Begin(PrimitiveType.Triangles);
-                foreach (var face in Faces)
-                {
-                    for (int i = 0; i < face.VertexIndices.Length; i++)
-                    {
-                        if (face.VertexIndices[i] < Vertices.Count)
-                            GL.Vertex3(Vertices[face.VertexIndices[i]]);
-                    }
-                }
-                GL.End();
+                GL.ActiveTexture(TextureUnit.Texture0);
+                GL.BindTexture(TextureTarget.Texture2D, ColorMapId >= 0 ? ColorMapId : 0);
+                shader.SetInt("colorMap", 0);
+                shader.SetInt("hasColorMap", ColorMapId >= 0 ? 1 : 0);
                 
-                GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Line);
-                GL.LineWidth(1.0f);
-                GL.Color3(0f, 0f, 0f);
+                GL.ActiveTexture(TextureUnit.Texture1);
+                GL.BindTexture(TextureTarget.Texture2D, NormalMapId >= 0 ? NormalMapId : 0);
+                shader.SetInt("normalMap", 1);
+                shader.SetInt("hasNormalMap", NormalMapId >= 0 ? 1 : 0);
                 
-                GL.Begin(PrimitiveType.Triangles);
-                foreach (var face in Faces)
-                {
-                    for (int i = 0; i < face.VertexIndices.Length; i++)
-                    {
-                        if (face.VertexIndices[i] < Vertices.Count)
-                            GL.Vertex3(Vertices[face.VertexIndices[i]]);
-                    }
-                }
-                GL.End();
+                GL.ActiveTexture(TextureUnit.Texture2);
+                GL.BindTexture(TextureTarget.Texture2D, SpecularMapId >= 0 ? SpecularMapId : 0);
+                shader.SetInt("specularMap", 2);
+                shader.SetInt("hasSpecularMap", SpecularMapId >= 0 ? 1 : 0);
                 
-                GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
+                GL.ActiveTexture(TextureUnit.Texture3);
+                GL.BindTexture(TextureTarget.Texture2D, RoughnessMapId >= 0 ? RoughnessMapId : 0);
+                shader.SetInt("roughnessMap", 3);
+                shader.SetInt("hasRoughnessMap", RoughnessMapId >= 0 ? 1 : 0);
+                
+                GL.ActiveTexture(TextureUnit.Texture4);
+                GL.BindTexture(TextureTarget.Texture2D, MetallicMapId >= 0 ? MetallicMapId : 0);
+                shader.SetInt("metallicMap", 4);
+                shader.SetInt("hasMetallicMap", MetallicMapId >= 0 ? 1 : 0);
+                
+                GL.ActiveTexture(TextureUnit.Texture5);
+                GL.BindTexture(TextureTarget.Texture2D, OpacityMapId >= 0 ? OpacityMapId : 0);
+                shader.SetInt("opacityMap", 5);
+                shader.SetInt("hasOpacityMap", OpacityMapId >= 0 ? 1 : 0);
             }
             else
             {
-                GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
-                GL.Enable(EnableCap.Lighting);
-                
-                bool useTexture = !solidWhite && HasTexture && TextureId >= 0;
-                
-                if (useTexture)
-                {
-                    GL.Enable(EnableCap.Texture2D);
-                    GL.BindTexture(TextureTarget.Texture2D, TextureId);
-                    GL.Color3(1f, 1f, 1f);
-                }
-                else
-                {
-                    GL.Color3(1f, 1f, 1f);
-                }
-                
-                GL.Begin(PrimitiveType.Triangles);
-                foreach (var face in Faces)
-                {
-                    for (int i = 0; i < face.VertexIndices.Length; i++)
-                    {
-                        if (useTexture && face.TexCoordIndices[i] < TexCoords.Count)
-                        {
-                            GL.TexCoord2(TexCoords[face.TexCoordIndices[i]]);
-                        }
-                        if (face.NormalIndices[i] < Normals.Count)
-                        {
-                            GL.Normal3(Normals[face.NormalIndices[i]]);
-                        }
-                        if (face.VertexIndices[i] < Vertices.Count)
-                        {
-                            GL.Vertex3(Vertices[face.VertexIndices[i]]);
-                        }
-                    }
-                }
-                GL.End();
-                
-                if (useTexture)
-                {
-                    GL.Disable(EnableCap.Texture2D);
-                }
+                shader.SetVec3("solidColor", new Vector3(1f, 1f, 1f));
+                shader.SetInt("hasColorMap", 0);
+                shader.SetInt("hasNormalMap", 0);
+                shader.SetInt("hasSpecularMap", 0);
+                shader.SetInt("hasRoughnessMap", 0);
+                shader.SetInt("hasMetallicMap", 0);
+                shader.SetInt("hasOpacityMap", 0);
             }
+            
+            GL.BindVertexArray(VAO);
+            GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0);
+            GL.BindVertexArray(0);
+        }
+        
+        public void Cleanup()
+        {
+            if (VAO != 0) GL.DeleteVertexArray(VAO);
+            if (VBO != 0) GL.DeleteBuffer(VBO);
+            if (EBO != 0) GL.DeleteBuffer(EBO);
         }
     }
     
@@ -337,18 +770,18 @@ namespace Viewer3D
         private TabControl tabControl;
         private TabPage envLightTab, statsShadingTab;
         private Button loadButton;
-        private Label verticesLabel, trianglesLabel, edgesLabel, loadedLabel;
+        private Label verticesLabel, trianglesLabel, edgesLabel, loadedLabel, noTextureLabel;
         private Panel previewPanel, lightControlPanel;
         
         private Button solidButton, wireframeButton, textureButton;
         private Button colorMapButton, normalMapButton, specularMapButton, metallicMapButton, roughnessMapButton, opacityMapButton;
         private Button showUVButton;
         
-        private float rotationX = 0f, rotationY = 0f;
+        private float rotationX = -20f, rotationY = 0f;
         private float zoom = -5f;
         private float panX = 0f, panY = 0f;
         private Vector3 lookAtPoint = Vector3.Zero;
-        private float minRotationX = -90f, maxRotationX = 90f;
+        private float minRotationX = -180f, maxRotationX = 180f;
         private float minZoom = -1f, maxZoom = -100f;
         
         private float lightAngle = 0f;
@@ -365,7 +798,9 @@ namespace Viewer3D
         private bool showUVPreview = false;
         private int currentTextureMap = 0;
         
-        // Windows default colors
+        private Shader mainShader, wireframeShader;
+        private int cubeVAO, cubeVBO;
+        
         private Color panelBg = Color.FromArgb(240, 240, 240);
         private Color buttonIdle = Color.FromArgb(225, 225, 225);
         private Color buttonHover = Color.FromArgb(229, 241, 251);
@@ -377,8 +812,38 @@ namespace Viewer3D
         {
             InitializeComponent();
             this.Load += (s, e) => SetupGL();
+            this.KeyPreview = true;
+            this.KeyDown += Viewer3DForm_KeyDown;
             glControl.Resize += (s, e) => { SetupProjection(); glControl.Invalidate(); };
             UpdateLabels();
+        }
+        
+        private void Viewer3DForm_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.R)
+            {
+                ResetCamera();
+                e.Handled = true;
+            }
+        }
+        
+        private void ResetCamera()
+        {
+            if (currentModel != null)
+            {
+                lookAtPoint = currentModel.GetModelCenter();
+                var modelSize = currentModel.GetModelSize();
+                zoom = -modelSize * 2.5f;
+            }
+            else
+            {
+                zoom = -5f;
+            }
+            rotationX = -20f;
+            rotationY = 0f;
+            panX = 0;
+            panY = 0;
+            glControl.Invalidate();
         }
         
         private void InitializeComponent()
@@ -390,7 +855,7 @@ namespace Viewer3D
             this.DragEnter += Viewer3DForm_DragEnter;
             this.DragDrop += Viewer3DForm_DragDrop;
             
-            glControl = new GLControl(new GraphicsMode(32, 24, 0, 4));
+            glControl = new GLControl(new GraphicsMode(32, 24, 0, 4), 3, 3, GraphicsContextFlags.ForwardCompatible);
             glControl.Dock = DockStyle.Fill;
             glControl.Paint += GlControl_Paint;
             glControl.MouseDown += GlControl_MouseDown;
@@ -414,6 +879,18 @@ namespace Viewer3D
             loadButton.MouseDown += (s, e) => loadButton.BackColor = buttonPress;
             loadButton.MouseUp += (s, e) => loadButton.BackColor = buttonHover;
             glControl.Controls.Add(loadButton);
+            
+            noTextureLabel = new Label
+            {
+                Text = "No texture found",
+                Location = new Point(10, 60),
+                Size = new Size(200, 30),
+                Font = new Font("Segoe UI", 10, FontStyle.Bold),
+                ForeColor = Color.FromArgb(200, 50, 50),
+                BackColor = Color.Transparent,
+                Visible = false
+            };
+            glControl.Controls.Add(noTextureLabel);
             
             tabControl = new TabControl
             {
@@ -469,13 +946,13 @@ namespace Viewer3D
             
             solidButton = AddStyledButton(statsShadingTab, "Solid Shading", ref y);
             solidButton.BackColor = buttonPress;
-            solidButton.Click += (s, e) => { shadingMode = 0; UpdateShadingButtons(); glControl.Invalidate(); };
+            solidButton.Click += (s, e) => { shadingMode = 0; UpdateShadingButtons(); UpdateNoTextureLabel(); glControl.Invalidate(); };
             
             wireframeButton = AddStyledButton(statsShadingTab, "Wireframe View", ref y);
-            wireframeButton.Click += (s, e) => { shadingMode = 1; UpdateShadingButtons(); glControl.Invalidate(); };
+            wireframeButton.Click += (s, e) => { shadingMode = 1; UpdateShadingButtons(); UpdateNoTextureLabel(); glControl.Invalidate(); };
             
             textureButton = AddStyledButton(statsShadingTab, "Texture View", ref y);
-            textureButton.Click += (s, e) => { shadingMode = 2; UpdateShadingButtons(); UpdateTextureButtonStates(); glControl.Invalidate(); };
+            textureButton.Click += (s, e) => { shadingMode = 2; UpdateShadingButtons(); UpdateTextureButtonStates(); UpdateNoTextureLabel(); glControl.Invalidate(); };
             y += 10;
             
             var texGroup = new GroupBox
@@ -490,22 +967,22 @@ namespace Viewer3D
             int gy = 25;
             colorMapButton = AddTextureButton(texGroup, "Color", ref gy);
             colorMapButton.BackColor = buttonPress;
-            colorMapButton.Click += (s, e) => { currentTextureMap = 0; if (currentModel != null) currentModel.SetActiveTexture(0); UpdateTextureButtons(); glControl.Invalidate(); };
+            colorMapButton.Click += (s, e) => { currentTextureMap = 0; if (currentModel != null) currentModel.SetActiveTexture(0); UpdateTextureButtons(); UpdateNoTextureLabel(); glControl.Invalidate(); };
             
             normalMapButton = AddTextureButton(texGroup, "Normal", ref gy);
-            normalMapButton.Click += (s, e) => { currentTextureMap = 1; if (currentModel != null) currentModel.SetActiveTexture(1); UpdateTextureButtons(); glControl.Invalidate(); };
+            normalMapButton.Click += (s, e) => { currentTextureMap = 1; if (currentModel != null) currentModel.SetActiveTexture(1); UpdateTextureButtons(); UpdateNoTextureLabel(); glControl.Invalidate(); };
             
             specularMapButton = AddTextureButton(texGroup, "Specular", ref gy);
-            specularMapButton.Click += (s, e) => { currentTextureMap = 2; if (currentModel != null) currentModel.SetActiveTexture(2); UpdateTextureButtons(); glControl.Invalidate(); };
+            specularMapButton.Click += (s, e) => { currentTextureMap = 2; if (currentModel != null) currentModel.SetActiveTexture(2); UpdateTextureButtons(); UpdateNoTextureLabel(); glControl.Invalidate(); };
             
             roughnessMapButton = AddTextureButton(texGroup, "Roughness", ref gy);
-            roughnessMapButton.Click += (s, e) => { currentTextureMap = 3; if (currentModel != null) currentModel.SetActiveTexture(3); UpdateTextureButtons(); glControl.Invalidate(); };
+            roughnessMapButton.Click += (s, e) => { currentTextureMap = 3; if (currentModel != null) currentModel.SetActiveTexture(3); UpdateTextureButtons(); UpdateNoTextureLabel(); glControl.Invalidate(); };
             
             metallicMapButton = AddTextureButton(texGroup, "Metallic", ref gy);
-            metallicMapButton.Click += (s, e) => { currentTextureMap = 4; if (currentModel != null) currentModel.SetActiveTexture(4); UpdateTextureButtons(); glControl.Invalidate(); };
+            metallicMapButton.Click += (s, e) => { currentTextureMap = 4; if (currentModel != null) currentModel.SetActiveTexture(4); UpdateTextureButtons(); UpdateNoTextureLabel(); glControl.Invalidate(); };
             
             opacityMapButton = AddTextureButton(texGroup, "Opacity", ref gy);
-            opacityMapButton.Click += (s, e) => { currentTextureMap = 5; if (currentModel != null) currentModel.SetActiveTexture(5); UpdateTextureButtons(); glControl.Invalidate(); };
+            opacityMapButton.Click += (s, e) => { currentTextureMap = 5; if (currentModel != null) currentModel.SetActiveTexture(5); UpdateTextureButtons(); UpdateNoTextureLabel(); glControl.Invalidate(); };
             
             y += 200;
             AddStyledButton(statsShadingTab, "Show Grid", ref y);
@@ -575,7 +1052,7 @@ namespace Viewer3D
                 FlatStyle = FlatStyle.Flat,
                 BackColor = buttonIdle,
                 FlatAppearance = { BorderColor = buttonBorder },
-                Enabled = false
+                Enabled = true
             };
             btn.MouseEnter += (s, e) => { if (btn.Enabled) { btn.BackColor = buttonHover; btn.FlatAppearance.BorderColor = buttonBorderActive; } };
             btn.MouseLeave += (s, e) => { if (btn.Enabled) { btn.BackColor = btn.BackColor == buttonPress ? buttonPress : buttonIdle; btn.FlatAppearance.BorderColor = buttonBorder; } };
@@ -584,13 +1061,35 @@ namespace Viewer3D
             parent.Controls.Add(btn);
             y += 26;
             return btn;
-			        }
+        }
         
         private Label CreateLabel(string text, int x, ref int y)
         {
             var lbl = new Label { Text = text, Location = new Point(x, y), AutoSize = true, BackColor = panelBg };
             y += 22;
             return lbl;
+        }
+        
+        private void UpdateNoTextureLabel()
+        {
+            if (currentModel == null)
+            {
+                noTextureLabel.Visible = false;
+                return;
+            }
+            
+            bool hasCurrentMap = false;
+            switch (currentTextureMap)
+            {
+                case 0: hasCurrentMap = currentModel.ColorMapId >= 0; break;
+                case 1: hasCurrentMap = currentModel.NormalMapId >= 0; break;
+                case 2: hasCurrentMap = currentModel.SpecularMapId >= 0; break;
+                case 3: hasCurrentMap = currentModel.RoughnessMapId >= 0; break;
+                case 4: hasCurrentMap = currentModel.MetallicMapId >= 0; break;
+                case 5: hasCurrentMap = currentModel.OpacityMapId >= 0; break;
+            }
+            
+            noTextureLabel.Visible = shadingMode == 2 && !hasCurrentMap;
         }
         
         private void UpdateTextureButtons()
@@ -606,19 +1105,26 @@ namespace Viewer3D
         private void UpdateTextureButtonStates()
         {
             bool enableTexButtons = shadingMode == 2 && currentModel != null;
-            colorMapButton.Enabled = enableTexButtons && currentModel.ColorMapId >= 0;
-            normalMapButton.Enabled = enableTexButtons && currentModel.NormalMapId >= 0;
-            specularMapButton.Enabled = enableTexButtons && currentModel.SpecularMapId >= 0;
-            roughnessMapButton.Enabled = enableTexButtons && currentModel.RoughnessMapId >= 0;
-            metallicMapButton.Enabled = enableTexButtons && currentModel.MetallicMapId >= 0;
-            opacityMapButton.Enabled = enableTexButtons && currentModel.OpacityMapId >= 0;
+            colorMapButton.Enabled = enableTexButtons;
+            normalMapButton.Enabled = enableTexButtons;
+            specularMapButton.Enabled = enableTexButtons;
+            roughnessMapButton.Enabled = enableTexButtons;
+            metallicMapButton.Enabled = enableTexButtons;
+            opacityMapButton.Enabled = enableTexButtons;
             
-            if (!colorMapButton.Enabled) colorMapButton.BackColor = Color.FromArgb(230, 230, 230);
-            if (!normalMapButton.Enabled) normalMapButton.BackColor = Color.FromArgb(230, 230, 230);
-            if (!specularMapButton.Enabled) specularMapButton.BackColor = Color.FromArgb(230, 230, 230);
-            if (!roughnessMapButton.Enabled) roughnessMapButton.BackColor = Color.FromArgb(230, 230, 230);
-            if (!metallicMapButton.Enabled) metallicMapButton.BackColor = Color.FromArgb(230, 230, 230);
-            if (!opacityMapButton.Enabled) opacityMapButton.BackColor = Color.FromArgb(230, 230, 230);
+            if (!enableTexButtons)
+            {
+                colorMapButton.BackColor = Color.FromArgb(230, 230, 230);
+                normalMapButton.BackColor = Color.FromArgb(230, 230, 230);
+                specularMapButton.BackColor = Color.FromArgb(230, 230, 230);
+                roughnessMapButton.BackColor = Color.FromArgb(230, 230, 230);
+                metallicMapButton.BackColor = Color.FromArgb(230, 230, 230);
+                opacityMapButton.BackColor = Color.FromArgb(230, 230, 230);
+            }
+            else
+            {
+                UpdateTextureButtons();
+            }
         }
         
         private void UpdateShadingButtons()
@@ -688,7 +1194,6 @@ namespace Viewer3D
                 float offsetX = previewPanel.Width / 2f;
                 float offsetY = previewPanel.Height / 2f;
                 
-                // Draw only every Nth face for performance on complex models
                 int step = currentModel.Faces.Count > 10000 ? 10 : currentModel.Faces.Count > 5000 ? 5 : 1;
                 
                 for (int faceIdx = 0; faceIdx < currentModel.Faces.Count; faceIdx += step)
@@ -721,40 +1226,88 @@ namespace Viewer3D
         {
             glControl.MakeCurrent();
             
+            mainShader = new Shader(ShaderSource.VertexShader, ShaderSource.FragmentShader);
+            wireframeShader = new Shader(ShaderSource.WireframeVertexShader, ShaderSource.WireframeFragmentShader);
+            
             GL.Enable(EnableCap.DepthTest);
-            GL.Enable(EnableCap.Lighting);
-            GL.Enable(EnableCap.Light0);
-            GL.Enable(EnableCap.Light1);
-            GL.Enable(EnableCap.ColorMaterial);
-            GL.ColorMaterial(MaterialFace.FrontAndBack, ColorMaterialParameter.AmbientAndDiffuse);
-            
-            GL.Light(LightName.Light0, LightParameter.Ambient, new[] { 0.4f, 0.4f, 0.4f, 1f });
-            GL.Light(LightName.Light0, LightParameter.Diffuse, new[] { 0.9f, 0.9f, 0.9f, 1f });
-            GL.Light(LightName.Light0, LightParameter.Specular, new[] { 0.6f, 0.6f, 0.6f, 1f });
-            
-            GL.Light(LightName.Light1, LightParameter.Position, new[] { -10f, -5f, -10f, 1f });
-            GL.Light(LightName.Light1, LightParameter.Ambient, new[] { 0.2f, 0.2f, 0.2f, 1f });
-            GL.Light(LightName.Light1, LightParameter.Diffuse, new[] { 0.5f, 0.5f, 0.5f, 1f });
-            
-            GL.ShadeModel(ShadingModel.Smooth);
-            GL.Material(MaterialFace.FrontAndBack, MaterialParameter.Specular, new[] { 0.5f, 0.5f, 0.5f, 1f });
-            GL.Material(MaterialFace.FrontAndBack, MaterialParameter.Shininess, 32f);
             GL.ClearColor(0.96f, 0.96f, 0.96f, 1f);
             
+            BuildCubeBuffers();
             SetupProjection();
+        }
+        
+        private void BuildCubeBuffers()
+        {
+            float[] cubeVertices = {
+                -1,-1, 1,  0, 0, 1,  0,0,  1,0,0,
+                 1,-1, 1,  0, 0, 1,  1,0,  1,0,0,
+                 1, 1, 1,  0, 0, 1,  1,1,  1,0,0,
+                -1, 1, 1,  0, 0, 1,  0,1,  1,0,0,
+                
+                -1,-1,-1,  0, 0,-1,  0,0,  1,0,0,
+                -1, 1,-1,  0, 0,-1,  0,1,  1,0,0,
+                 1, 1,-1,  0, 0,-1,  1,1,  1,0,0,
+                 1,-1,-1,  0, 0,-1,  1,0,  1,0,0,
+                
+                -1,-1,-1, -1, 0, 0,  0,0,  0,1,0,
+                -1,-1, 1, -1, 0, 0,  1,0,  0,1,0,
+                -1, 1, 1, -1, 0, 0,  1,1,  0,1,0,
+                -1, 1,-1, -1, 0, 0,  0,1,  0,1,0,
+                
+                 1,-1,-1,  1, 0, 0,  0,0,  0,1,0,
+                 1, 1,-1,  1, 0, 0,  0,1,  0,1,0,
+                 1, 1, 1,  1, 0, 0,  1,1,  0,1,0,
+                 1,-1, 1,  1, 0, 0,  1,0,  0,1,0,
+                
+                -1, 1,-1,  0, 1, 0,  0,0,  0,0,1,
+                -1, 1, 1,  0, 1, 0,  0,1,  0,0,1,
+                 1, 1, 1,  0, 1, 0,  1,1,  0,0,1,
+                 1, 1,-1,  0, 1, 0,  1,0,  0,0,1,
+                
+                -1,-1,-1,  0,-1, 0,  0,0,  0,0,1,
+                 1,-1,-1,  0,-1, 0,  1,0,  0,0,1,
+                 1,-1, 1,  0,-1, 0,  1,1,  0,0,1,
+                -1,-1, 1,  0,-1, 0,  0,1,  0,0,1
+            };
+            
+            uint[] cubeIndices = {
+                0,1,2, 2,3,0,
+                4,5,6, 6,7,4,
+                8,9,10, 10,11,8,
+                12,13,14, 14,15,12,
+                16,17,18, 18,19,16,
+                20,21,22, 22,23,20
+            };
+            
+            cubeVAO = GL.GenVertexArray();
+            cubeVBO = GL.GenBuffer();
+            int cubeEBO = GL.GenBuffer();
+            
+            GL.BindVertexArray(cubeVAO);
+            
+            GL.BindBuffer(BufferTarget.ArrayBuffer, cubeVBO);
+            GL.BufferData(BufferTarget.ArrayBuffer, cubeVertices.Length * sizeof(float), cubeVertices, BufferUsageHint.StaticDraw);
+            
+            GL.BindBuffer(BufferTarget.ElementArrayBuffer, cubeEBO);
+            GL.BufferData(BufferTarget.ElementArrayBuffer, cubeIndices.Length * sizeof(uint), cubeIndices, BufferUsageHint.StaticDraw);
+            
+            int stride = 11 * sizeof(float);
+            GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, stride, 0);
+            GL.EnableVertexAttribArray(0);
+            GL.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, 3 * sizeof(float));
+            GL.EnableVertexAttribArray(1);
+            GL.VertexAttribPointer(2, 2, VertexAttribPointerType.Float, false, stride, 6 * sizeof(float));
+            GL.EnableVertexAttribArray(2);
+            GL.VertexAttribPointer(3, 3, VertexAttribPointerType.Float, false, stride, 8 * sizeof(float));
+            GL.EnableVertexAttribArray(3);
+            
+            GL.BindVertexArray(0);
         }
         
         private void SetupProjection()
         {
             if (glControl.Width == 0 || glControl.Height == 0) return;
-            
             GL.Viewport(0, 0, glControl.Width, glControl.Height);
-            GL.MatrixMode(MatrixMode.Projection);
-            GL.LoadIdentity();
-            var aspectRatio = (float)glControl.Width / glControl.Height;
-            Matrix4 perspective = Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45), aspectRatio, 0.1f, 500f);
-            GL.LoadMatrix(ref perspective);
-            GL.MatrixMode(MatrixMode.Modelview);
         }
         
         private void GlControl_Paint(object sender, PaintEventArgs e)
@@ -762,44 +1315,108 @@ namespace Viewer3D
             if (!glControl.Context.IsCurrent) glControl.MakeCurrent();
             
             GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
-            GL.LoadIdentity();
+            
+            var aspectRatio = (float)glControl.Width / glControl.Height;
+            Matrix4 projection = Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45), aspectRatio, 0.1f, 500f);
+            
+            Matrix4 view = Matrix4.CreateTranslation(panX, panY, zoom);
+            Matrix4 rotation = Matrix4.CreateRotationX(MathHelper.DegreesToRadians(rotationX + 90)) * 
+                              Matrix4.CreateRotationY(MathHelper.DegreesToRadians(rotationY));
+            view = rotation * view;
             
             float lightX = (float)Math.Cos(lightAngle) * 10f;
             float lightZ = (float)Math.Sin(lightAngle) * 10f;
-            GL.Light(LightName.Light0, LightParameter.Position, new[] { lightX, 10f, lightZ, 1f });
-            GL.Light(LightName.Light1, LightParameter.Position, new[] { -10f, -5f, -10f, 1f });
+            Vector3 lightPos = new Vector3(lightX, 10f, lightZ);
+            Vector3 lightPos2 = new Vector3(-10f, -5f, -10f);
             
-            GL.Translate(panX, panY, zoom);
-            GL.Rotate(rotationX, 1, 0, 0);
-            GL.Rotate(rotationY, 0, 1, 0);
+            Matrix4 viewInv = view.Inverted();
+            Vector3 viewPos = new Vector3(viewInv.M41, viewInv.M42, viewInv.M43);
             
-            if (showDefaultCube)
+            if (shadingMode == 1)
             {
-                DrawCube();
-            }
-            else if (currentModel != null)
-            {
-                var center = currentModel.GetModelCenter();
-                GL.Translate(-center.X, -center.Y, -center.Z);
+                GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
+                wireframeShader.Use();
+                wireframeShader.SetVec3("color", new Vector3(0.96f, 0.96f, 0.96f));
                 
-                bool renderWhite = (shadingMode == 0) || (shadingMode == 2 && currentModel.TextureId < 0);
-                currentModel.Render(shadingMode == 1, renderWhite);
+                Matrix4 model = Matrix4.Identity;
+                if (!showDefaultCube && currentModel != null)
+                {
+                    var center = currentModel.GetModelCenter();
+                    model = Matrix4.CreateTranslation(-center);
+                }
+                
+                wireframeShader.SetMat4("model", ref model);
+                wireframeShader.SetMat4("view", ref view);
+                wireframeShader.SetMat4("projection", ref projection);
+                
+                if (showDefaultCube)
+                {
+                    GL.BindVertexArray(cubeVAO);
+                    GL.DrawElements(PrimitiveType.Triangles, 36, DrawElementsType.UnsignedInt, 0);
+                }
+                else if (currentModel != null)
+                {
+                    GL.BindVertexArray(currentModel.VAO);
+                    GL.DrawElements(PrimitiveType.Triangles, currentModel.Faces.Count * 3, DrawElementsType.UnsignedInt, 0);
+                }
+                
+                GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Line);
+                GL.LineWidth(1.0f);
+                wireframeShader.SetVec3("color", new Vector3(0f, 0f, 0f));
+                
+                if (showDefaultCube)
+                {
+                    GL.BindVertexArray(cubeVAO);
+                    GL.DrawElements(PrimitiveType.Triangles, 36, DrawElementsType.UnsignedInt, 0);
+                }
+                else if (currentModel != null)
+                {
+                    GL.BindVertexArray(currentModel.VAO);
+                    GL.DrawElements(PrimitiveType.Triangles, currentModel.Faces.Count * 3, DrawElementsType.UnsignedInt, 0);
+                }
+                
+                GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
+            }
+            else
+            {
+                mainShader.Use();
+                mainShader.SetVec3("lightPos", lightPos);
+                mainShader.SetVec3("lightPos2", lightPos2);
+                mainShader.SetVec3("viewPos", viewPos);
+                mainShader.SetMat4("projection", ref projection);
+                mainShader.SetMat4("view", ref view);
+                
+                Matrix4 model = Matrix4.Identity;
+                if (!showDefaultCube && currentModel != null)
+                {
+                    var center = currentModel.GetModelCenter();
+                    model = Matrix4.CreateTranslation(-center);
+                }
+                
+                mainShader.SetMat4("model", ref model);
+                
+                if (showDefaultCube)
+                {
+                    mainShader.SetInt("shadingMode", 0);
+                    mainShader.SetVec3("solidColor", new Vector3(0.5f, 0.7f, 1f));
+                    mainShader.SetInt("hasColorMap", 0);
+                    mainShader.SetInt("hasNormalMap", 0);
+                    mainShader.SetInt("hasSpecularMap", 0);
+                    mainShader.SetInt("hasRoughnessMap", 0);
+                    mainShader.SetInt("hasMetallicMap", 0);
+                    mainShader.SetInt("hasOpacityMap", 0);
+                    
+                    GL.BindVertexArray(cubeVAO);
+                    GL.DrawElements(PrimitiveType.Triangles, 36, DrawElementsType.UnsignedInt, 0);
+                }
+                else if (currentModel != null)
+                {
+                    currentModel.Render(mainShader, shadingMode);
+                }
             }
             
+            GL.BindVertexArray(0);
             glControl.SwapBuffers();
-        }
-        
-        private void DrawCube()
-        {
-            GL.Color3(0.5f, 0.7f, 1f);
-            GL.Begin(PrimitiveType.Quads);
-            GL.Normal3(0, 0, 1); GL.Vertex3(-1, -1, 1); GL.Vertex3(1, -1, 1); GL.Vertex3(1, 1, 1); GL.Vertex3(-1, 1, 1);
-            GL.Normal3(0, 0, -1); GL.Vertex3(-1, -1, -1); GL.Vertex3(-1, 1, -1); GL.Vertex3(1, 1, -1); GL.Vertex3(1, -1, -1);
-            GL.Normal3(-1, 0, 0); GL.Vertex3(-1, -1, -1); GL.Vertex3(-1, -1, 1); GL.Vertex3(-1, 1, 1); GL.Vertex3(-1, 1, -1);
-            GL.Normal3(1, 0, 0); GL.Vertex3(1, -1, -1); GL.Vertex3(1, 1, -1); GL.Vertex3(1, 1, 1); GL.Vertex3(1, -1, 1);
-            GL.Normal3(0, 1, 0); GL.Vertex3(-1, 1, -1); GL.Vertex3(-1, 1, 1); GL.Vertex3(1, 1, 1); GL.Vertex3(1, 1, -1);
-            GL.Normal3(0, -1, 0); GL.Vertex3(-1, -1, -1); GL.Vertex3(1, -1, -1); GL.Vertex3(1, -1, 1); GL.Vertex3(-1, -1, 1);
-            GL.End();
         }
         
         private void LoadButton_Click(object sender, EventArgs e)
@@ -814,6 +1431,9 @@ namespace Viewer3D
         
         private void LoadOBJFile(string filename)
         {
+            if (currentModel != null)
+                currentModel.Cleanup();
+                
             currentModel = new OBJLoader();
             currentModel.LoadFromFile(filename);
             showDefaultCube = false;
@@ -823,11 +1443,14 @@ namespace Viewer3D
             minZoom = -modelSize * 0.1f;
             maxZoom = -modelSize * 20f;
             panX = 0; panY = 0;
+            rotationX = -20f;
+            rotationY = 0f;
             lookAtPoint = currentModel.GetModelCenter();
             
             loadedLabel.Text = Path.GetFileName(filename);
             UpdateLabels();
             UpdateTextureButtonStates();
+            UpdateNoTextureLabel();
             glControl.Invalidate();
         }
         
@@ -854,15 +1477,7 @@ namespace Viewer3D
                 TimeSpan timeSinceLastClick = DateTime.Now - lastClickTime;
                 if (timeSinceLastClick.TotalMilliseconds < SystemInformation.DoubleClickTime)
                 {
-                    if (currentModel != null)
-                    {
-                        lookAtPoint = currentModel.GetModelCenter();
-                        rotationX = 0;
-                        rotationY = 0;
-                        panX = 0;
-                        panY = 0;
-                        glControl.Invalidate();
-                    }
+                    ResetCamera();
                 }
                 lastClickTime = DateTime.Now;
                 
@@ -919,22 +1534,44 @@ namespace Viewer3D
             {
                 string file = files[0];
                 if (file.EndsWith(".obj", StringComparison.OrdinalIgnoreCase))
-                    LoadOBJFile(file);
-                else if (currentModel != null && (file.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ||
-                    file.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
-                    file.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase)))
                 {
-                    currentModel.LoadTexture(file);
+                    LoadOBJFile(file);
+                }
+                else if (currentModel != null && (
+                    file.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ||
+                    file.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                    file.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+                    file.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase) ||
+                    file.EndsWith(".dds", StringComparison.OrdinalIgnoreCase) ||
+                    file.EndsWith(".tga", StringComparison.OrdinalIgnoreCase)))
+                {
+                    currentModel.LoadTexture(file, currentTextureMap);
                     UpdateTextureButtonStates();
+                    UpdateNoTextureLabel();
                     glControl.Invalidate();
                 }
             }
+        }
+        
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            base.OnFormClosing(e);
+            if (currentModel != null)
+                currentModel.Cleanup();
+            GL.DeleteVertexArray(cubeVAO);
+            GL.DeleteBuffer(cubeVBO);
         }
     }
     
     static class Program
     {
         [STAThread]
-        static void Main() { Application.EnableVisualStyles(); Application.Run(new Viewer3DForm()); }
+        static void Main() 
+        { 
+            Application.EnableVisualStyles(); 
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new Viewer3DForm()); 
+        }
     }
 }
+ 
